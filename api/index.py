@@ -70,29 +70,40 @@ def fmt(v,kind='birth'):
  if kind=='birth' and year>now: year-=100
  if kind!='birth' and year<now-10: year+=100
  return f'{dd:02d}/{mm:02d}/{year:04d}'
+def _clean_name_candidate(value):
+ value=re.sub(r'[^A-Z <\-]',' ',(value or '').upper())
+ value=re.sub(r'<+',' ',value); value=re.sub(r'\s+',' ',value).strip()
+ # OCR occasionally emits a clipped 1-2 letter fragment (for example AB) as its own word.
+ toks=value.split()
+ toks=[t for t in toks if len(t)>2]
+ return ' '.join(toks)
+
 def printed_name(text):
- # Egyptian passports often wrap the English full name over several OCR lines.
- # Collect name-looking lines after the Full Name label while skipping bilingual labels/noise.
+ # Build several candidates because OCR.Space may split an Egyptian full name across lines.
  lines=[re.sub(r'\s+',' ',x).strip() for x in text.splitlines()]
- stop_words=('DATE OF','PLACE OF','NATIONAL','PASSPORT','OCCUPATION','SEX','AUTHORITY','SIGNATURE','BIRTH','EXPIRY','ISSUE')
+ stops=('DATE OF','PLACE OF','NATIONAL','PASSPORT','OCCUPATION','SEX','AUTHORITY','SIGNATURE','BIRTH','EXPIRY','ISSUE','PROFESSION')
+ candidates=[]
  for i,line in enumerate(lines):
   if re.search(r'full\s*na(?:me|ge)',line,re.I):
    vals=[]
-   for raw in lines[i+1:i+8]:
-    z=re.sub(r'[^A-Z <\-]',' ',raw.upper()); z=re.sub(r'\s+',' ',z).strip(' <')
-    z=re.sub(r'^(?:SE|NAME|FULL NAME)\s+(?=[A-Z]{3,})','',z).strip()
-    if any(k in z for k in stop_words):
+   for raw in lines[i+1:i+12]:
+    z=_clean_name_candidate(raw)
+    if any(k in z for k in stops):
      if vals: break
      continue
-    # Ignore Arabic-only/garbage rows, but don't stop: OCR may insert one between name rows.
-    if len(z)>=5 and sum(ch.isalpha() for ch in z)>=4:
-     vals.append(z.replace('<',' '))
+    if z and len(z)>=3 and sum(c.isalpha() for c in z)>=3:
+     vals.append(z)
    if vals:
-    name=re.sub(r'\s+',' ',' '.join(vals)).strip()
-    # A 1-2 letter token in the middle is normally a clipped OCR line, not a real name.
-    if not re.search(r'(?<!^)\b[A-Z]{1,2}\b(?!$)',name): return name
-    return name
- return ''
+    # Try the complete wrapped block and each progressive prefix; longest useful result wins.
+    for n in range(1,len(vals)+1): candidates.append(' '.join(vals[:n]))
+ # Also catch a name printed on the same OCR line as the label.
+ for line in lines:
+  m=re.search(r'full\s*na(?:me|ge)\s*[:\-]?\s*([A-Z][A-Z <\-]{5,})',line,re.I)
+  if m: candidates.append(_clean_name_candidate(m.group(1)))
+ candidates=[_clean_name_candidate(x) for x in candidates]
+ candidates=[x for x in candidates if len(x.split())>=2]
+ return max(candidates,key=lambda x:(len(x.split()),len(x)),default='')
+
 def parse_mrz(text):
  raw=[re.sub(r'\s','',x.upper()) for x in text.splitlines() if '<' in x]; lines=[]; out={}
  for x in raw:
@@ -115,12 +126,13 @@ def parse_mrz(text):
     out.update(passport_no=q[:9].replace('<',''),nationality=q[10:13].replace('<',''),birth_date=fmt(q[13:19]),gender=q[20:21].replace('<',''),expiry_date=fmt(q[21:27],'expiry'))
    break
  pn=printed_name(text)
- # OCR.Space can wrap/reorder the printed name. Reject obviously truncated fragments and
- # prefer the structurally reliable MRZ ordering in that case.
- if pn and not re.search(r'\b[A-Z]{1,2}\b',pn) and len(pn.split())>=3:
+ mrz=_clean_name_candidate(out.get('mrz_name',''))
+ # Egyptian MRZ names are length-limited and OCR may clip a word. Prefer the printed
+ # full-name block whenever it contains at least as much usable name information.
+ if pn and (len(pn.split())>=len(mrz.split()) or len(pn)>=len(mrz)):
   out['name']=pn
  else:
-  out['name']=out.get('mrz_name','') or pn
+  out['name']=mrz or pn
  return out
 def ocr(raw,mime,name='passport'):
  key=os.environ.get('OCR_SPACE_API_KEY','').strip()
@@ -147,17 +159,18 @@ def ocr(raw,mime,name='passport'):
   return text
  # Primary: proper multipart upload with original filename + explicit filetype.
  try:
-  r=requests.post('https://api.ocr.space/parse/image',files={'file':(name,raw,safe_mime)},data=payload,timeout=55)
+  r=requests.post('https://api.ocr.space/parse/image',files={'file':(name,raw,safe_mime)},data=payload,timeout=25)
   text=parse_response(r)
  except Exception as first:
-  # Fallback: data-URI upload avoids file-extension detection issues (E216).
+  # Retry with data URI only for OCR.Space's file-type detection error. Avoid a second
+  # long OCR call for unrelated failures so the booking UI stays responsive.
+  msg=str(first)
+  if 'E216' not in msg and 'file type' not in msg.lower() and 'extension' not in msg.lower():
+   raise
   data_uri='data:'+safe_mime+';base64,'+base64.b64encode(raw).decode('ascii')
   p2=dict(payload); p2['base64Image']=data_uri
-  try:
-   r=requests.post('https://api.ocr.space/parse/image',data=p2,timeout=55)
-   text=parse_response(r)
-  except Exception as second:
-   raise RuntimeError(f'{second}') from second
+  r=requests.post('https://api.ocr.space/parse/image',data=p2,timeout=25)
+  text=parse_response(r)
  d=parse_mrz(text); d['raw_text']=text[:5000]
  # Do not report a false OCR success if no useful passport field was found.
  if not any(d.get(k) for k in ('name','passport_no','birth_date','expiry_date')):
