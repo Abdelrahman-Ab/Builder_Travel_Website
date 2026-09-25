@@ -2,9 +2,22 @@ import os,re,json,base64,hashlib,hmac,secrets,io,zipfile,requests
 from flask import Flask,request,jsonify,session,Response
 import psycopg
 from psycopg.rows import dict_row
+from vercel.blob import BlobClient
 
 app=Flask(__name__); app.secret_key=os.environ.get('SECRET_KEY','change-me-before-production')
 DB=os.environ.get('DATABASE_URL','')
+
+def blob_put_bytes(pathname, raw, mime):
+    with BlobClient() as client:
+        result=client.put(pathname,raw,access='private',content_type=mime,add_random_suffix=True)
+        return result.pathname
+
+def blob_get_bytes(pathname):
+    if not pathname: return None
+    with BlobClient() as client:
+        result=client.get(pathname,access='private')
+        if result is None or result.status_code!=200 or result.stream is None: return None
+        return b''.join(result.stream)
 
 def conn():
     if not DB: raise RuntimeError('DATABASE_URL is not configured')
@@ -23,6 +36,7 @@ CREATE TABLE IF NOT EXISTS bookings(id SERIAL PRIMARY KEY,code TEXT UNIQUE,packa
 CREATE TABLE IF NOT EXISTS passengers(id SERIAL PRIMARY KEY,booking_id INTEGER,name TEXT,passport_no TEXT,nationality TEXT,birth_date TEXT,expiry_date TEXT,gender TEXT,passport_name TEXT,passport_mime TEXT,passport_blob BYTEA,ocr_status TEXT,visa_status TEXT DEFAULT 'pending');
 CREATE TABLE IF NOT EXISTS waitlist(id SERIAL PRIMARY KEY,package_id INTEGER,name TEXT,phone TEXT,passengers INTEGER,room_type TEXT,created_at TIMESTAMPTZ DEFAULT NOW());
 CREATE TABLE IF NOT EXISTS audit(id SERIAL PRIMARY KEY,"user" TEXT,action TEXT,created_at TIMESTAMPTZ DEFAULT NOW());''')
+    q.execute('ALTER TABLE passengers ADD COLUMN IF NOT EXISTS passport_blob_path TEXT')
     q.execute('select 1 from users limit 1')
     if not q.fetchone(): q.execute('insert into users(name,email,password,role) values(%s,%s,%s,%s)',('مدير النظام','admin@buildertravel.com',hashpw('Builder@2026'),'owner'))
     q.execute('select 1 from packages limit 1')
@@ -78,7 +92,7 @@ def ocr(raw,mime,name='passport'):
 def setup():
  if request.path.startswith('/api/'): init()
 @app.route('/api/health')
-def health(): return jsonify(ok=True,ocr=bool(os.environ.get('OCR_SPACE_API_KEY')),database=bool(DB))
+def health(): return jsonify(ok=True,ocr=bool(os.environ.get('OCR_SPACE_API_KEY')),database=bool(DB),blob=bool(os.environ.get('BLOB_READ_WRITE_TOKEN')))
 @app.route('/api/packages')
 def packages():
  with conn() as c:
@@ -113,9 +127,11 @@ def book():
     code='BT-'+secrets.token_hex(3).upper(); q.execute('insert into bookings(code,package_id,customer_name,phone,email,room_type,passengers,status,payment) values(%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id',(code,d['package_id'],d['name'],d['phone'],d.get('email',''),rt,n,'reserved','pending')); bid=q.fetchone()['id']
     q.execute(f'update packages set seats_booked=seats_booked+%s, {col}={col}-1 where id=%s',(n,d['package_id']))
     for x in d.get('passenger_data',[]):
-     blob=None; pn=''; pm=''
-     if x.get('passport_data'): blob=base64.b64decode(x['passport_data'].split(',')[-1]); pn=x.get('passport_name','passport.pdf'); pm=x.get('passport_mime','application/octet-stream')
-     q.execute('insert into passengers(booking_id,name,passport_no,nationality,birth_date,expiry_date,gender,passport_name,passport_mime,passport_blob,ocr_status) values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',(bid,x.get('name',''),x.get('passport_no',''),x.get('nationality',''),x.get('birth_date',''),x.get('expiry_date',''),x.get('gender',''),pn,pm,blob,'reviewed'))
+     blob_path=None; pn=''; pm=''
+     if x.get('passport_data'):
+      raw=base64.b64decode(x['passport_data'].split(',')[-1]); pn=x.get('passport_name','passport.pdf'); pm=x.get('passport_mime','application/octet-stream')
+      ext=os.path.splitext(pn)[1][:10] or '.bin'; blob_path=blob_put_bytes(f'passports/{code}/{secrets.token_hex(8)}{ext}',raw,pm)
+     q.execute('insert into passengers(booking_id,name,passport_no,nationality,birth_date,expiry_date,gender,passport_name,passport_mime,passport_blob_path,ocr_status) values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',(bid,x.get('name',''),x.get('passport_no',''),x.get('nationality',''),x.get('birth_date',''),x.get('expiry_date',''),x.get('gender',''),pn,pm,blob_path,'reviewed'))
   return jsonify(ok=True,code=code)
  except Exception as e:return jsonify(error=str(e)),400
 
@@ -163,11 +179,12 @@ def dl(pid):
  with conn() as c:
   with c.cursor() as q:q.execute('select ps.*,b.code,b.phone,b.email,p.title_ar from passengers ps join bookings b on b.id=ps.booking_id left join packages p on p.id=b.package_id where ps.id=%s',(pid,)); d=q.fetchone()
  if not d:return jsonify(error='not found'),404
- safe=re.sub(r'[^A-Za-z0-9._ -]+','_',d.get('name') or f'passenger-{pid}').strip(); info={k:v for k,v in d.items() if k!='passport_blob'}; out=io.BytesIO()
+ safe=re.sub(r'[^A-Za-z0-9._ -]+','_',d.get('name') or f'passenger-{pid}').strip(); info={k:v for k,v in d.items() if k not in ('passport_blob','passport_blob_path')}; out=io.BytesIO()
  with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED) as z:
   z.writestr(f'{safe}/Passenger-Data.txt','BUILDER TRAVEL - PASSENGER FILE\n\n'+'\n'.join(f'{k}: {v or ""}' for k,v in info.items()))
   z.writestr(f'{safe}/Passenger-Data.json',json.dumps(info,ensure_ascii=False,indent=2,default=str))
-  if d.get('passport_blob'): z.writestr(f'{safe}/{d.get("passport_name") or "Passport"}',bytes(d['passport_blob']))
+  passport_bytes=blob_get_bytes(d.get('passport_blob_path')) if d.get('passport_blob_path') else (bytes(d['passport_blob']) if d.get('passport_blob') else None)
+  if passport_bytes: z.writestr(f'{safe}/{d.get("passport_name") or "Passport"}',passport_bytes)
  data=out.getvalue(); return Response(data,mimetype='application/zip',headers={'Content-Disposition':f'attachment; filename="{safe}.zip"'})
 @app.route('/api/admin/passenger-update',methods=['POST'])
 def pup():
