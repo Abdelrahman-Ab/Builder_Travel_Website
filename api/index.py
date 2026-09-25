@@ -71,15 +71,27 @@ def fmt(v,kind='birth'):
  if kind!='birth' and year<now-10: year+=100
  return f'{dd:02d}/{mm:02d}/{year:04d}'
 def printed_name(text):
+ # Egyptian passports often wrap the English full name over several OCR lines.
+ # Collect name-looking lines after the Full Name label while skipping bilingual labels/noise.
  lines=[re.sub(r'\s+',' ',x).strip() for x in text.splitlines()]
+ stop_words=('DATE OF','PLACE OF','NATIONAL','PASSPORT','OCCUPATION','SEX','AUTHORITY','SIGNATURE','BIRTH','EXPIRY','ISSUE')
  for i,line in enumerate(lines):
   if re.search(r'full\s*na(?:me|ge)',line,re.I):
    vals=[]
-   for z in lines[i+1:i+4]:
-    z=re.sub(r'[^A-Z <\-]',' ',z.upper()); z=re.sub(r'\s+',' ',z).strip(' <'); z=re.sub(r'^SE\s+(?=[A-Z]{4,})','',z)
-    if len(z)>=8 and sum(ch.isalpha() for ch in z)>=7 and not any(k in z for k in ['DATE OF','PLACE OF','NATIONAL','PASSPORT']): vals.append(z.replace('<',' '))
-    elif vals: break
-   if vals:return re.sub(r'\s+',' ',' '.join(vals)).strip()
+   for raw in lines[i+1:i+8]:
+    z=re.sub(r'[^A-Z <\-]',' ',raw.upper()); z=re.sub(r'\s+',' ',z).strip(' <')
+    z=re.sub(r'^(?:SE|NAME|FULL NAME)\s+(?=[A-Z]{3,})','',z).strip()
+    if any(k in z for k in stop_words):
+     if vals: break
+     continue
+    # Ignore Arabic-only/garbage rows, but don't stop: OCR may insert one between name rows.
+    if len(z)>=5 and sum(ch.isalpha() for ch in z)>=4:
+     vals.append(z.replace('<',' '))
+   if vals:
+    name=re.sub(r'\s+',' ',' '.join(vals)).strip()
+    # A 1-2 letter token in the middle is normally a clipped OCR line, not a real name.
+    if not re.search(r'(?<!^)\b[A-Z]{1,2}\b(?!$)',name): return name
+    return name
  return ''
 def parse_mrz(text):
  raw=[re.sub(r'\s','',x.upper()) for x in text.splitlines() if '<' in x]; lines=[]; out={}
@@ -105,7 +117,7 @@ def parse_mrz(text):
  pn=printed_name(text)
  # OCR.Space can wrap/reorder the printed name. Reject obviously truncated fragments and
  # prefer the structurally reliable MRZ ordering in that case.
- if pn and not re.search(r'\b[A-Z]{1,2}$',pn) and len(pn.split())>=3:
+ if pn and not re.search(r'\b[A-Z]{1,2}\b',pn) and len(pn.split())>=3:
   out['name']=pn
  else:
   out['name']=out.get('mrz_name','') or pn
