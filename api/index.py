@@ -6,6 +6,7 @@ from vercel.blob import BlobClient
 
 app=Flask(__name__); app.secret_key=os.environ.get('SECRET_KEY','change-me-before-production')
 DB=os.environ.get('DATABASE_URL','')
+_schema_ready=False
 INIT_DONE=False
 
 def blob_configured():
@@ -35,6 +36,8 @@ def checkpw(p,x):
     s,h=x.split('$'); return hmac.compare_digest(hashpw(p,s).split('$')[1],h)
 def auth(): return session.get('user')
 def init():
+ global _schema_ready
+ if _schema_ready: return
  global INIT_DONE
  if INIT_DONE: return
  with conn() as c:
@@ -55,6 +58,7 @@ CREATE TABLE IF NOT EXISTS audit(id SERIAL PRIMARY KEY,"user" TEXT,action TEXT,c
      rows=[('عمرة جمادى الأولى','Jumada Al-Awwal Umrah','umrah',10,'2026-10-18','2026-10-28','مصر للطيران',20,11,58000,54000,51000,5,7,8,'active','kaaba','فندق 5 نجوم قريب من الحرم','فندق 5 نجوم'),('عمرة رجب','Rajab Umrah','umrah',8,'2026-12-15','2026-12-23','السعودية',24,20,62000,57500,54000,3,5,6,'active','medina','سويس أوتيل المقام','أنوار المدينة موڤنبيك'),('عمرة شعبان','Shaaban Umrah','umrah',10,'2027-01-20','2027-01-30','مصر للطيران',30,30,68000,63000,59000,0,0,0,'full','kaaba2','فندق مطل على الحرم','فندق بالمنطقة المركزية'),('الحج المميز 2027','Premium Hajj 2027','hajj',14,'2027-05-10','2027-05-24','السعودية',40,7,245000,225000,210000,8,10,12,'active','hajj','إقامة مميزة بمكة','إقامة مميزة بالمدينة')]
      q.executemany('''insert into packages(title_ar,title_en,kind,days,start_date,end_date,airline,seats_total,seats_booked,price_double,price_triple,price_quad,rooms_double,rooms_triple,rooms_quad,status,image,hotel_makkah,hotel_madinah) values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)''',rows)
   c.commit()
+ _schema_ready=True
  INIT_DONE=True
 
 def fmt(v,kind='birth'):
@@ -81,17 +85,31 @@ def parse_mrz(text):
  raw=[re.sub(r'\s','',x.upper()) for x in text.splitlines() if '<' in x]; lines=[]; out={}
  for x in raw:
   m=re.search(r'(P<[A-Z0-9<]{35,})',x)
-  if m:lines.append(m.group(1)[:44])
+  if m: lines.append(m.group(1)[:44])
   else:
    m=re.search(r'[A-Z0-9<]{40,}',x)
-   if m:lines.append(m.group(0)[:44])
+   if m: lines.append(m.group(0)[:44])
  for i,l in enumerate(lines):
   if len(l)>=40 and l.startswith('P<'):
-   out['mrz_name']=' '.join(x.replace('<',' ').strip() for x in l[5:44].split('<<',1) if x).strip(); q=lines[i+1] if i+1<len(lines) else ''
+   # TD3 MRZ stores SURNAME << GIVEN NAMES. Customer-facing full name should read
+   # given names first and family name last, matching the printed Egyptian passport name.
+   name_field=l[5:44]
+   parts=name_field.split('<<',1)
+   surname=re.sub(r'<+',' ',parts[0]).strip()
+   given=re.sub(r'<+',' ',parts[1] if len(parts)>1 else '').strip()
+   out['mrz_name']=re.sub(r'\s+',' ',(' '.join(x for x in (given,surname) if x))).strip()
+   q=lines[i+1] if i+1<len(lines) else ''
    if len(q)>=27:
     out.update(passport_no=q[:9].replace('<',''),nationality=q[10:13].replace('<',''),birth_date=fmt(q[13:19]),gender=q[20:21].replace('<',''),expiry_date=fmt(q[21:27],'expiry'))
    break
- out['name']=printed_name(text) or out.get('mrz_name',''); return out
+ pn=printed_name(text)
+ # OCR.Space can wrap/reorder the printed name. Reject obviously truncated fragments and
+ # prefer the structurally reliable MRZ ordering in that case.
+ if pn and not re.search(r'\b[A-Z]{1,2}$',pn) and len(pn.split())>=3:
+  out['name']=pn
+ else:
+  out['name']=out.get('mrz_name','') or pn
+ return out
 def ocr(raw,mime,name='passport'):
  key=os.environ.get('OCR_SPACE_API_KEY','').strip()
  if not key: raise RuntimeError('OCR_SPACE_API_KEY is not configured')
