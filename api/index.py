@@ -6,6 +6,7 @@ from vercel.blob import BlobClient
 
 app=Flask(__name__); app.secret_key=os.environ.get('SECRET_KEY','change-me-before-production')
 DB=os.environ.get('DATABASE_URL','')
+INIT_DONE=False
 
 def blob_configured():
     # On Vercel, connected Blob stores use OIDC by default. The SDK pairs
@@ -34,21 +35,27 @@ def checkpw(p,x):
     s,h=x.split('$'); return hmac.compare_digest(hashpw(p,s).split('$')[1],h)
 def auth(): return session.get('user')
 def init():
-  with conn() as c:
-   with c.cursor() as q:
-    q.execute('''CREATE TABLE IF NOT EXISTS users(id SERIAL PRIMARY KEY,name TEXT,email TEXT UNIQUE,password TEXT,role TEXT);
+ global INIT_DONE
+ if INIT_DONE: return
+ with conn() as c:
+  with c.cursor() as q:
+   # Serialize bootstrap work across concurrent Vercel cold starts.
+   q.execute('SELECT pg_advisory_xact_lock(%s)', (726421937,))
+   q.execute('''CREATE TABLE IF NOT EXISTS users(id SERIAL PRIMARY KEY,name TEXT,email TEXT UNIQUE,password TEXT,role TEXT);
 CREATE TABLE IF NOT EXISTS packages(id SERIAL PRIMARY KEY,title_ar TEXT,title_en TEXT,kind TEXT,days INTEGER,start_date TEXT,end_date TEXT,airline TEXT,seats_total INTEGER,seats_booked INTEGER,price_double INTEGER,price_triple INTEGER,price_quad INTEGER,rooms_double INTEGER,rooms_triple INTEGER,rooms_quad INTEGER,status TEXT,image TEXT,hotel_makkah TEXT,hotel_madinah TEXT);
 CREATE TABLE IF NOT EXISTS bookings(id SERIAL PRIMARY KEY,code TEXT UNIQUE,package_id INTEGER,customer_name TEXT,phone TEXT,email TEXT,room_type TEXT,passengers INTEGER,status TEXT,payment TEXT,created_at TIMESTAMPTZ DEFAULT NOW());
 CREATE TABLE IF NOT EXISTS passengers(id SERIAL PRIMARY KEY,booking_id INTEGER,name TEXT,passport_no TEXT,nationality TEXT,birth_date TEXT,expiry_date TEXT,gender TEXT,passport_name TEXT,passport_mime TEXT,passport_blob BYTEA,ocr_status TEXT,visa_status TEXT DEFAULT 'pending');
 CREATE TABLE IF NOT EXISTS waitlist(id SERIAL PRIMARY KEY,package_id INTEGER,name TEXT,phone TEXT,passengers INTEGER,room_type TEXT,created_at TIMESTAMPTZ DEFAULT NOW());
 CREATE TABLE IF NOT EXISTS audit(id SERIAL PRIMARY KEY,"user" TEXT,action TEXT,created_at TIMESTAMPTZ DEFAULT NOW());''')
-    q.execute('ALTER TABLE passengers ADD COLUMN IF NOT EXISTS passport_blob_path TEXT')
-    q.execute('select 1 from users limit 1')
-    if not q.fetchone(): q.execute('insert into users(name,email,password,role) values(%s,%s,%s,%s)',('مدير النظام','admin@buildertravel.com',hashpw('Builder@2026'),'owner'))
-    q.execute('select 1 from packages limit 1')
-    if not q.fetchone():
-      rows=[('عمرة جمادى الأولى','Jumada Al-Awwal Umrah','umrah',10,'2026-10-18','2026-10-28','مصر للطيران',20,11,58000,54000,51000,5,7,8,'active','kaaba','فندق 5 نجوم قريب من الحرم','فندق 5 نجوم'),('عمرة رجب','Rajab Umrah','umrah',8,'2026-12-15','2026-12-23','السعودية',24,20,62000,57500,54000,3,5,6,'active','medina','سويس أوتيل المقام','أنوار المدينة موڤنبيك'),('عمرة شعبان','Shaaban Umrah','umrah',10,'2027-01-20','2027-01-30','مصر للطيران',30,30,68000,63000,59000,0,0,0,'full','kaaba2','فندق مطل على الحرم','فندق بالمنطقة المركزية'),('الحج المميز 2027','Premium Hajj 2027','hajj',14,'2027-05-10','2027-05-24','السعودية',40,7,245000,225000,210000,8,10,12,'active','hajj','إقامة مميزة بمكة','إقامة مميزة بالمدينة')]
-      q.executemany('''insert into packages(title_ar,title_en,kind,days,start_date,end_date,airline,seats_total,seats_booked,price_double,price_triple,price_quad,rooms_double,rooms_triple,rooms_quad,status,image,hotel_makkah,hotel_madinah) values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)''',rows)
+   q.execute('ALTER TABLE passengers ADD COLUMN IF NOT EXISTS passport_blob_path TEXT')
+   q.execute('select 1 from users limit 1')
+   if not q.fetchone(): q.execute('insert into users(name,email,password,role) values(%s,%s,%s,%s)',('مدير النظام','admin@buildertravel.com',hashpw('Builder@2026'),'owner'))
+   q.execute('select 1 from packages limit 1')
+   if not q.fetchone():
+     rows=[('عمرة جمادى الأولى','Jumada Al-Awwal Umrah','umrah',10,'2026-10-18','2026-10-28','مصر للطيران',20,11,58000,54000,51000,5,7,8,'active','kaaba','فندق 5 نجوم قريب من الحرم','فندق 5 نجوم'),('عمرة رجب','Rajab Umrah','umrah',8,'2026-12-15','2026-12-23','السعودية',24,20,62000,57500,54000,3,5,6,'active','medina','سويس أوتيل المقام','أنوار المدينة موڤنبيك'),('عمرة شعبان','Shaaban Umrah','umrah',10,'2027-01-20','2027-01-30','مصر للطيران',30,30,68000,63000,59000,0,0,0,'full','kaaba2','فندق مطل على الحرم','فندق بالمنطقة المركزية'),('الحج المميز 2027','Premium Hajj 2027','hajj',14,'2027-05-10','2027-05-24','السعودية',40,7,245000,225000,210000,8,10,12,'active','hajj','إقامة مميزة بمكة','إقامة مميزة بالمدينة')]
+     q.executemany('''insert into packages(title_ar,title_en,kind,days,start_date,end_date,airline,seats_total,seats_booked,price_double,price_triple,price_quad,rooms_double,rooms_triple,rooms_quad,status,image,hotel_makkah,hotel_madinah) values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)''',rows)
+  c.commit()
+ INIT_DONE=True
 
 def fmt(v,kind='birth'):
  v=re.sub(r'\D','',v or '')[:6]
@@ -234,3 +241,21 @@ def package():
     q.execute('insert into audit("user",action) values(%s,%s)',(auth()['email'],action))
   return jsonify(ok=True,id=newid)
  except Exception as e:return jsonify(error=str(e)),400
+
+
+@app.route('/api/index.py', methods=['GET','POST'])
+def vercel_api_gateway():
+    """Vercel Python entrypoint gateway. Public JS sends the intended API path in ?route=."""
+    target=request.args.get('route','')
+    routes={
+      '/api/health':health,'/api/packages':packages,'/api/login':login,'/api/logout':logout,'/api/me':me,
+      '/api/ocr':doocr,'/api/book':book,'/api/admin/summary':summary,'/api/admin/bookings':bookings,
+      '/api/admin/passengers':passengers,'/api/admin/waitlist':waitlist,'/api/admin/users':users,
+      '/api/admin/passenger-update':pup,'/api/admin/booking-update':bup,'/api/admin/user':adduser,'/api/admin/package':package
+    }
+    if target.startswith('/api/admin/passenger-download/'):
+        try: return dl(int(target.rsplit('/',1)[-1]))
+        except (TypeError,ValueError): return jsonify(error='invalid passenger id'),400
+    fn=routes.get(target)
+    if not fn: return jsonify(error='API route not found',route=target),404
+    return fn()
