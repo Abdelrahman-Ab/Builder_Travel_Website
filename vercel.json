@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/index.py" },
+    { "source": "/admin", "destination": "/index.html" },
+    { "source": "/admin/(.*)", "destination": "/index.html" },
+    { "source": "/en", "destination": "/index.html" },
+    { "source": "/packages", "destination": "/index.html" },
+    { "source": "/offers", "destination": "/index.html" },
+    { "source": "/services", "destination": "/index.html" },
+    { "source": "/about", "destination": "/index.html" },
+    { "source": "/contact", "destination": "/index.html" },
+    { "source": "/my-trip", "destination": "/index.html" },
+    { "source": "/package/(.*)", "destination": "/index.html" }
+  ]
+}
