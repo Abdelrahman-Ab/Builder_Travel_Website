@@ -95,11 +95,28 @@ def parse_mrz(text):
 def ocr(raw,mime,name='passport'):
  key=os.environ.get('OCR_SPACE_API_KEY','')
  if not key: raise RuntimeError('OCR_SPACE_API_KEY is not configured')
- files={'file':(name,raw,mime)}
- r=requests.post('https://api.ocr.space/parse/image',files=files,data={'apikey':key,'language':'eng','isOverlayRequired':'false','OCREngine':'2','scale':'true'},timeout=55)
- j=r.json()
- if j.get('IsErroredOnProcessing'): raise RuntimeError(str(j.get('ErrorMessage') or 'OCR failed'))
- text='\n'.join(x.get('ParsedText','') for x in j.get('ParsedResults',[])); d=parse_mrz(text); d['raw_text']=text[:5000]; return d
+ # Preserve a real extension and also tell OCR.Space the type explicitly.
+ # Browser/Vercel uploads can otherwise arrive with a generic or missing MIME.
+ name=os.path.basename(name or 'passport').strip() or 'passport'
+ mime=(mime or '').split(';',1)[0].lower().strip()
+ ext=os.path.splitext(name)[1].lower()
+ by_mime={'application/pdf':('.pdf','PDF'),'image/jpeg':('.jpg','JPG'),'image/jpg':('.jpg','JPG'),'image/png':('.png','PNG')}
+ by_ext={'.pdf':('application/pdf','PDF'),'.jpg':('image/jpeg','JPG'),'.jpeg':('image/jpeg','JPG'),'.png':('image/png','PNG')}
+ if ext in by_ext:
+  safe_mime,filetype=by_ext[ext]
+ elif mime in by_mime:
+  safe_ext,filetype=by_mime[mime]; safe_mime=mime; name=name+safe_ext
+ else:
+  raise RuntimeError('Unsupported passport file type. Please upload PDF, JPG, JPEG, or PNG.')
+ files={'file':(name,raw,safe_mime)}
+ payload={'apikey':key,'language':'eng','isOverlayRequired':'false','OCREngine':'2','scale':'true','filetype':filetype}
+ r=requests.post('https://api.ocr.space/parse/image',files=files,data=payload,timeout=55)
+ try: j=r.json()
+ except Exception: raise RuntimeError(f'OCR service returned HTTP {r.status_code}')
+ if r.status_code>=400 or j.get('IsErroredOnProcessing'): raise RuntimeError(str(j.get('ErrorMessage') or j.get('ErrorDetails') or f'OCR failed (HTTP {r.status_code})'))
+ text='\n'.join(x.get('ParsedText','') for x in j.get('ParsedResults',[]))
+ if not text.strip(): raise RuntimeError('OCR completed but returned no readable text')
+ d=parse_mrz(text); d['raw_text']=text[:5000]; return d
 
 @app.before_request
 def setup():

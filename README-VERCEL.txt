@@ -39,3 +39,5 @@ Required project connection/environment: BLOB_STORE_ID. Vercel injects and rotat
 VERCEL_OIDC_TOKEN at runtime. Do not copy or persist VERCEL_OIDC_TOKEN in code.
 BLOB_READ_WRITE_TOKEN is not required for the Vercel deployment; it remains a
 fallback supported by the SDK for non-Vercel/local use.
+
+V5: OCR upload now preserves the original passport filename and explicitly sends PDF/JPG/PNG filetype to OCR.Space.
