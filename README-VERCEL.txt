@@ -31,3 +31,11 @@ DATA
 
 PRODUCTION NOTE
 Before accepting real customer passports at scale, move passport binaries to dedicated encrypted private object storage, add a formal retention policy, 2FA, audit review, backups, and production privacy/security controls.
+
+V3 storage authentication
+-------------------------
+Private passport storage uses the Vercel Blob project connection with OIDC.
+Required project connection/environment: BLOB_STORE_ID. Vercel injects and rotates
+VERCEL_OIDC_TOKEN at runtime. Do not copy or persist VERCEL_OIDC_TOKEN in code.
+BLOB_READ_WRITE_TOKEN is not required for the Vercel deployment; it remains a
+fallback supported by the SDK for non-Vercel/local use.

@@ -7,6 +7,12 @@ from vercel.blob import BlobClient
 app=Flask(__name__); app.secret_key=os.environ.get('SECRET_KEY','change-me-before-production')
 DB=os.environ.get('DATABASE_URL','')
 
+def blob_configured():
+    # On Vercel, connected Blob stores use OIDC by default. The SDK pairs
+    # BLOB_STORE_ID with VERCEL_OIDC_TOKEN automatically. A static
+    # BLOB_READ_WRITE_TOKEN remains supported only as a fallback/local option.
+    return bool(os.environ.get('BLOB_STORE_ID') and (os.environ.get('VERCEL_OIDC_TOKEN') or os.environ.get('BLOB_READ_WRITE_TOKEN')))
+
 def blob_put_bytes(pathname, raw, mime):
     with BlobClient() as client:
         result=client.put(pathname,raw,access='private',content_type=mime,add_random_suffix=True)
@@ -92,7 +98,7 @@ def ocr(raw,mime,name='passport'):
 def setup():
  if request.path.startswith('/api/'): init()
 @app.route('/api/health')
-def health(): return jsonify(ok=True,ocr=bool(os.environ.get('OCR_SPACE_API_KEY')),database=bool(DB),blob=bool(os.environ.get('BLOB_READ_WRITE_TOKEN')))
+def health(): return jsonify(ok=True,ocr=bool(os.environ.get('OCR_SPACE_API_KEY')),database=bool(DB),blob=blob_configured())
 @app.route('/api/packages')
 def packages():
  with conn() as c:
