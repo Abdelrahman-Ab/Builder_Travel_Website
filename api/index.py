@@ -9,10 +9,10 @@ DB=os.environ.get('DATABASE_URL','')
 INIT_DONE=False
 
 def blob_configured():
-    # On Vercel, connected Blob stores use OIDC by default. The SDK pairs
-    # BLOB_STORE_ID with VERCEL_OIDC_TOKEN automatically. A static
-    # BLOB_READ_WRITE_TOKEN remains supported only as a fallback/local option.
-    return bool(os.environ.get('BLOB_STORE_ID') and (os.environ.get('VERCEL_OIDC_TOKEN') or os.environ.get('BLOB_READ_WRITE_TOKEN')))
+    # vercel-python 0.11.x currently authenticates BlobClient with a static token.
+    # If Vercel only exposes OIDC, bookings still work safely by storing the
+    # passport in PostgreSQL BYTEA until the Python SDK gains compatible OIDC.
+    return bool(os.environ.get('BLOB_READ_WRITE_TOKEN') or os.environ.get('VERCEL_BLOB_READ_WRITE_TOKEN'))
 
 def blob_put_bytes(pathname, raw, mime):
     with BlobClient() as client:
@@ -93,36 +93,52 @@ def parse_mrz(text):
    break
  out['name']=printed_name(text) or out.get('mrz_name',''); return out
 def ocr(raw,mime,name='passport'):
- key=os.environ.get('OCR_SPACE_API_KEY','')
+ key=os.environ.get('OCR_SPACE_API_KEY','').strip()
  if not key: raise RuntimeError('OCR_SPACE_API_KEY is not configured')
- # Preserve a real extension and also tell OCR.Space the type explicitly.
- # Browser/Vercel uploads can otherwise arrive with a generic or missing MIME.
  name=os.path.basename(name or 'passport').strip() or 'passport'
  mime=(mime or '').split(';',1)[0].lower().strip()
  ext=os.path.splitext(name)[1].lower()
- by_mime={'application/pdf':('.pdf','PDF'),'image/jpeg':('.jpg','JPG'),'image/jpg':('.jpg','JPG'),'image/png':('.png','PNG')}
  by_ext={'.pdf':('application/pdf','PDF'),'.jpg':('image/jpeg','JPG'),'.jpeg':('image/jpeg','JPG'),'.png':('image/png','PNG')}
+ by_mime={'application/pdf':('.pdf','PDF'),'image/jpeg':('.jpg','JPG'),'image/jpg':('.jpg','JPG'),'image/png':('.png','PNG')}
  if ext in by_ext:
   safe_mime,filetype=by_ext[ext]
  elif mime in by_mime:
   safe_ext,filetype=by_mime[mime]; safe_mime=mime; name=name+safe_ext
  else:
   raise RuntimeError('Unsupported passport file type. Please upload PDF, JPG, JPEG, or PNG.')
- files={'file':(name,raw,safe_mime)}
- payload={'apikey':key,'language':'eng','isOverlayRequired':'false','OCREngine':'2','scale':'true','filetype':filetype}
- r=requests.post('https://api.ocr.space/parse/image',files=files,data=payload,timeout=55)
- try: j=r.json()
- except Exception: raise RuntimeError(f'OCR service returned HTTP {r.status_code}')
- if r.status_code>=400 or j.get('IsErroredOnProcessing'): raise RuntimeError(str(j.get('ErrorMessage') or j.get('ErrorDetails') or f'OCR failed (HTTP {r.status_code})'))
- text='\n'.join(x.get('ParsedText','') for x in j.get('ParsedResults',[]))
- if not text.strip(): raise RuntimeError('OCR completed but returned no readable text')
- d=parse_mrz(text); d['raw_text']=text[:5000]; return d
+ payload={'apikey':key,'language':'eng','isOverlayRequired':'false','OCREngine':'2','scale':'true','filetype':filetype,'detectOrientation':'true'}
+ def parse_response(r):
+  try: j=r.json()
+  except Exception: raise RuntimeError(f'OCR service returned HTTP {r.status_code}')
+  if r.status_code>=400 or j.get('IsErroredOnProcessing'):
+   raise RuntimeError(str(j.get('ErrorMessage') or j.get('ErrorDetails') or f'OCR failed (HTTP {r.status_code})'))
+  text='\n'.join(x.get('ParsedText','') for x in j.get('ParsedResults',[]))
+  if not text.strip(): raise RuntimeError('OCR completed but returned no readable text')
+  return text
+ # Primary: proper multipart upload with original filename + explicit filetype.
+ try:
+  r=requests.post('https://api.ocr.space/parse/image',files={'file':(name,raw,safe_mime)},data=payload,timeout=55)
+  text=parse_response(r)
+ except Exception as first:
+  # Fallback: data-URI upload avoids file-extension detection issues (E216).
+  data_uri='data:'+safe_mime+';base64,'+base64.b64encode(raw).decode('ascii')
+  p2=dict(payload); p2['base64Image']=data_uri
+  try:
+   r=requests.post('https://api.ocr.space/parse/image',data=p2,timeout=55)
+   text=parse_response(r)
+  except Exception as second:
+   raise RuntimeError(f'{second}') from second
+ d=parse_mrz(text); d['raw_text']=text[:5000]
+ # Do not report a false OCR success if no useful passport field was found.
+ if not any(d.get(k) for k in ('name','passport_no','birth_date','expiry_date')):
+  raise RuntimeError('OCR read the document but could not identify passport fields')
+ return d
 
 @app.before_request
 def setup():
  if request.path.startswith('/api/'): init()
 @app.route('/api/health')
-def health(): return jsonify(ok=True,ocr=bool(os.environ.get('OCR_SPACE_API_KEY')),database=bool(DB),blob=blob_configured())
+def health(): return jsonify(ok=True,ocr=bool(os.environ.get('OCR_SPACE_API_KEY')),database=bool(DB),blob=blob_configured(),passport_storage=('blob' if blob_configured() else 'postgres'))
 @app.route('/api/packages')
 def packages():
  with conn() as c:
@@ -157,11 +173,18 @@ def book():
     code='BT-'+secrets.token_hex(3).upper(); q.execute('insert into bookings(code,package_id,customer_name,phone,email,room_type,passengers,status,payment) values(%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id',(code,d['package_id'],d['name'],d['phone'],d.get('email',''),rt,n,'reserved','pending')); bid=q.fetchone()['id']
     q.execute(f'update packages set seats_booked=seats_booked+%s, {col}={col}-1 where id=%s',(n,d['package_id']))
     for x in d.get('passenger_data',[]):
-     blob_path=None; pn=''; pm=''
+     blob_path=None; passport_db=None; pn=''; pm=''
      if x.get('passport_data'):
       raw=base64.b64decode(x['passport_data'].split(',')[-1]); pn=x.get('passport_name','passport.pdf'); pm=x.get('passport_mime','application/octet-stream')
-      ext=os.path.splitext(pn)[1][:10] or '.bin'; blob_path=blob_put_bytes(f'passports/{code}/{secrets.token_hex(8)}{ext}',raw,pm)
-     q.execute('insert into passengers(booking_id,name,passport_no,nationality,birth_date,expiry_date,gender,passport_name,passport_mime,passport_blob_path,ocr_status) values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',(bid,x.get('name',''),x.get('passport_no',''),x.get('nationality',''),x.get('birth_date',''),x.get('expiry_date',''),x.get('gender',''),pn,pm,blob_path,'reviewed'))
+      if blob_configured():
+       try:
+        ext=os.path.splitext(pn)[1][:10] or '.bin'; blob_path=blob_put_bytes(f'passports/{code}/{secrets.token_hex(8)}{ext}',raw,pm)
+       except Exception:
+        # Never fail a paid/reserved booking because the object-store SDK auth changed.
+        passport_db=raw
+      else:
+       passport_db=raw
+     q.execute('insert into passengers(booking_id,name,passport_no,nationality,birth_date,expiry_date,gender,passport_name,passport_mime,passport_blob,passport_blob_path,ocr_status) values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',(bid,x.get('name',''),x.get('passport_no',''),x.get('nationality',''),x.get('birth_date',''),x.get('expiry_date',''),x.get('gender',''),pn,pm,passport_db,blob_path,('reviewed' if x.get('passport_no') or x.get('name') else 'manual_review')))
   return jsonify(ok=True,code=code)
  except Exception as e:return jsonify(error=str(e)),400
 
@@ -189,7 +212,9 @@ def passengers():
  x=need()
  if x:return x
  with conn() as c:
-  with c.cursor() as q:q.execute('select ps.id,ps.booking_id,ps.name,ps.passport_no,ps.nationality,ps.birth_date,ps.expiry_date,ps.gender,ps.ocr_status,ps.visa_status,ps.passport_name,b.code,b.phone,b.email,p.title_ar from passengers ps join bookings b on b.id=ps.booking_id left join packages p on p.id=b.package_id order by ps.id desc'); return jsonify(q.fetchall())
+  with c.cursor() as q:
+   q.execute('select ps.id,ps.booking_id,ps.name,ps.passport_no,ps.nationality,ps.birth_date,ps.expiry_date,ps.gender,ps.ocr_status,ps.visa_status,ps.passport_name,(ps.passport_blob_path is not null or ps.passport_blob is not null) as passport_file,b.code,b.phone,b.email,p.title_ar from passengers ps join bookings b on b.id=ps.booking_id left join packages p on p.id=b.package_id order by ps.id desc')
+   return jsonify(q.fetchall())
 @app.route('/api/admin/waitlist')
 def waitlist():
  x=need()
@@ -213,7 +238,11 @@ def dl(pid):
  with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED) as z:
   z.writestr(f'{safe}/Passenger-Data.txt','BUILDER TRAVEL - PASSENGER FILE\n\n'+'\n'.join(f'{k}: {v or ""}' for k,v in info.items()))
   z.writestr(f'{safe}/Passenger-Data.json',json.dumps(info,ensure_ascii=False,indent=2,default=str))
-  passport_bytes=blob_get_bytes(d.get('passport_blob_path')) if d.get('passport_blob_path') else (bytes(d['passport_blob']) if d.get('passport_blob') else None)
+  passport_bytes=None
+  if d.get('passport_blob_path') and blob_configured():
+   try: passport_bytes=blob_get_bytes(d.get('passport_blob_path'))
+   except Exception: passport_bytes=None
+  if passport_bytes is None and d.get('passport_blob'): passport_bytes=bytes(d['passport_blob'])
   if passport_bytes: z.writestr(f'{safe}/{d.get("passport_name") or "Passport"}',passport_bytes)
  data=out.getvalue(); return Response(data,mimetype='application/zip',headers={'Content-Disposition':f'attachment; filename="{safe}.zip"'})
 @app.route('/api/admin/passenger-update',methods=['POST'])

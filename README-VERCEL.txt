@@ -41,3 +41,10 @@ BLOB_READ_WRITE_TOKEN is not required for the Vercel deployment; it remains a
 fallback supported by the SDK for non-Vercel/local use.
 
 V5: OCR upload now preserves the original passport filename and explicitly sends PDF/JPG/PNG filetype to OCR.Space.
+
+V6 reliability update (2026-09-26)
+- OCR.Space upload now retries using a base64 data URI if multipart file-type detection fails.
+- Passport storage no longer blocks booking when the Python Vercel Blob SDK cannot use the project's OIDC connection.
+- If a compatible Blob read/write token is available, passports use Private Blob; otherwise they are stored in PostgreSQL BYTEA and remain downloadable from the authenticated admin passenger ZIP.
+- Admin passenger cards correctly show whether a passport file is stored.
+- /api/health reports the active passport storage backend (blob or postgres).
